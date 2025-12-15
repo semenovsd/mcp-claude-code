@@ -1,0 +1,62 @@
+[tool.poetry]
+name = "mcp-claude-code"
+version = "0.1.0"
+description = "MCP Server for Claude Code CLI with full interactive capabilities"
+authors = ["Stanislav Semenov <semenov_sd@bk.ru>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/mcp-claude-code/mcp-claude-code"
+repository = "https://github.com/mcp-claude-code/mcp-claude-code"
+keywords = ["mcp", "claude", "claude-code", "ai", "llm", "cursor", "cline"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+packages = [{include = "mcp_claude_code", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.13"
+fastmcp = "^2.13.0"
+pydantic = "^2.0.0"
+pydantic-settings = "^2.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.24.0"
+mypy = "^1.8.0"
+ruff = "^0.6.0"
+uvicorn = "^0.38.0"
+httpx = "^0.28.1"
+
+[tool.poetry.scripts]
+mcp-claude-code = "mcp_claude_code.server:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+strict = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
