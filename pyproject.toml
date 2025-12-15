@@ -1,13 +1,35 @@
 [tool.poetry]
 name = "mcp-claude-code"
 version = "0.1.0"
-description = "MCP Server for Claude Code CLI with full interactive capabilities"
+description = "MCP Server for Claude Code CLI with full interactive capabilities - permissions, questions, choices, confirmations, and progress indication via MCP Elicitation"
 authors = ["Stanislav Semenov <semenov_sd@bk.ru>"]
 license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/mcp-claude-code/mcp-claude-code"
 repository = "https://github.com/mcp-claude-code/mcp-claude-code"
-keywords = ["mcp", "claude", "claude-code", "ai", "llm", "cursor", "cline"]
+keywords = [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "claude-code-cli",
+    "ai",
+    "llm",
+    "cursor",
+    "cline",
+    "fastmcp",
+    "interactive",
+    "permissions",
+    "elicitation",
+    "ide-integration",
+    "automation",
+    "code-generation",
+    "ai-assistant",
+    "session-resumption",
+    "progress-indication",
+    "python",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

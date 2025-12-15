@@ -2,7 +2,7 @@
 
 **MCP Server for Claude Code CLI with full interactive capabilities.**
 
-Provides seamless access to Claude Code CLI through MCP protocol with native IDE integration:
+An MCP (Model Context Protocol) server that provides seamless access to Claude Code CLI through MCP protocol with native IDE integration for Cursor, Cline, and other MCP-compatible clients. Features interactive permissions, questions, choices, confirmations, and real-time progress indication via MCP Elicitation.
 
 - **Permission Requests** - File/command approvals via MCP Elicitation
 - **Text Questions** - Free-form user input
@@ -161,6 +161,41 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
 | Cursor 2.0+ | ✅ Full |
 | VS Code + Cline | ⚠️ Depends on version |
 | Claude Desktop | ❌ Not supported |
+
+## Topics
+
+This project is tagged with the following topics for easy discovery:
+
+**Core Technologies:**
+- `mcp` - Model Context Protocol
+- `mcp-server` - MCP server implementation
+- `model-context-protocol` - Official MCP specification
+- `claude` - Claude AI integration
+- `claude-code` - Claude Code CLI wrapper
+- `claude-code-cli` - Command-line interface integration
+
+**AI & LLM:**
+- `ai` - Artificial Intelligence
+- `llm` - Large Language Models
+- `ai-assistant` - AI coding assistant
+- `code-generation` - Automated code generation
+
+**IDE Integration:**
+- `cursor` - Cursor IDE support
+- `cline` - Cline extension support
+- `ide-integration` - IDE integration capabilities
+- `fastmcp` - FastMCP framework
+
+**Features:**
+- `interactive` - Interactive capabilities
+- `permissions` - Permission management system
+- `elicitation` - MCP Elicitation support
+- `session-resumption` - Multi-turn conversation support
+- `progress-indication` - Real-time progress updates
+- `automation` - Development automation
+
+**Language & Platform:**
+- `python` - Python implementation
 
 ## License
 
