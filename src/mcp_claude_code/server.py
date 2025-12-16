@@ -126,20 +126,33 @@ async def _graceful_shutdown(sig: signal.Signals) -> None:
 
 
 def _setup_signal_handlers() -> None:
-    """Setup signal handlers for graceful shutdown."""
-    loop = asyncio.get_event_loop()
+    """Setup signal handlers for graceful shutdown.
+    
+    Uses signal.signal() to work before the event loop is running.
+    The handler schedules the async shutdown task on the running event loop.
+    """
+    def _signal_handler(sig: int) -> None:
+        """Synchronous signal handler that schedules async shutdown."""
+        signal_enum = signal.Signals(sig)
+        logger.info(f"Received {signal_enum.name}, scheduling graceful shutdown...")
+        
+        # Get the running event loop (FastMCP's loop)
+        try:
+            loop = asyncio.get_running_loop()
+            # Schedule the async shutdown task
+            loop.create_task(_graceful_shutdown(signal_enum))
+        except RuntimeError:
+            # No event loop running yet - this shouldn't happen, but handle gracefully
+            logger.warning("No event loop running, cannot schedule graceful shutdown")
+            sys.exit(1)
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            # Use default parameter to capture sig value correctly
-            def handler(s: signal.Signals = sig) -> None:
-                asyncio.create_task(_graceful_shutdown(s))
-
-            loop.add_signal_handler(sig, handler)
+            signal.signal(sig, _signal_handler)
             logger.debug(f"Registered signal handler for {sig.name}")
-        except NotImplementedError:
-            # Windows doesn't support add_signal_handler
-            logger.debug(f"Signal handler for {sig.name} not supported on this platform")
+        except (ValueError, OSError) as e:
+            # Windows or other platform issues
+            logger.debug(f"Signal handler for {sig.name} not supported: {e}")
 
 
 def main() -> None:
@@ -148,8 +161,11 @@ def main() -> None:
     logger.info(f"Settings: permission_timeout={settings.permission_timeout_seconds}s, "
                 f"socket_retries={settings.socket_retry_attempts}")
 
-    # Note: FastMCP manages its own event loop, so we setup handlers after it starts
-    # Signal handlers will be set up when the first tool call creates an event loop
+    # Setup signal handlers before starting the server
+    # This uses signal.signal() which works synchronously and will schedule
+    # async shutdown tasks on FastMCP's event loop when signals are received
+    _setup_signal_handlers()
+
     mcp.run(show_banner=False)
 
 
