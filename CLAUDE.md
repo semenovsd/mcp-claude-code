@@ -44,6 +44,40 @@ async def execute_claude(
 
 ---
 
+## Configuration (Settings)
+
+All settings can be overridden via environment variables with `MCP_CLAUDE_` prefix:
+
+```python
+class Settings(BaseSettings):
+    # Claude Code CLI
+    claude_code_path: str = "claude"
+    default_model: str = "sonnet"
+
+    # Timeouts
+    max_execution_seconds: int = 600
+    inactivity_timeout_seconds: int = 120
+
+    # Permission-specific timeouts (user may be away)
+    permission_timeout_seconds: int = 3600  # 60 minutes
+    socket_read_timeout_seconds: int = 120
+
+    # Retry settings for Unix socket
+    socket_retry_attempts: int = 3
+    socket_retry_delay_seconds: float = 0.1  # Exponential backoff
+
+    # Storage
+    permission_storage_path: str = "~/.mcp-claude-code/permissions.json"
+```
+
+**Environment variables examples:**
+```bash
+MCP_CLAUDE_PERMISSION_TIMEOUT_SECONDS=1800  # 30 minutes
+MCP_CLAUDE_SOCKET_RETRY_ATTEMPTS=5
+```
+
+---
+
 ## Progress Indication System
 
 ### Key Components
@@ -99,9 +133,41 @@ Cursor/Cline UI: [Allow Once] [Allow Session] [Allow Always] [Deny]
 
 ### Key Files
 
-- `src/mcp_claude_code/permission_server/approver.py` - MCP permission tool
+- `src/mcp_claude_code/permission_server/approver.py` - MCP permission tool with retry logic
 - `src/mcp_claude_code/permission_server/callback_server.py` - Unix socket elicitation bridge
 - `src/mcp_claude_code/storage/permission_manager.py` - Permission caching and persistence
+
+### Permission Response Enum
+
+```python
+class PermissionResponse(Enum):
+    """User-facing permission response labels for MCP Elicitation UI."""
+    ALLOW_ONCE = "Allow Once"
+    ALLOW_SESSION = "Allow Session"
+    ALLOW_ALWAYS = "Allow Always"
+    DENY = "Deny"
+
+    @classmethod
+    def all_options(cls) -> list[str]: ...
+    @classmethod
+    def from_string(cls, value: str) -> "PermissionResponse": ...
+    def to_decision(self) -> PermissionDecision: ...
+```
+
+### Retry Logic (approver.py)
+
+The approver uses exponential backoff for Unix socket connections:
+
+```python
+async def request_permission_via_socket(
+    socket_path: str,
+    tool_name: str,
+    tool_input: dict,
+    timeout_seconds: float = 3600,    # 60 min - user may be away
+    retry_attempts: int = 3,
+    retry_delay: float = 0.1,         # Exponential backoff
+) -> dict: ...
+```
 
 ---
 
@@ -119,7 +185,30 @@ Cursor/Cline UI: [Allow Once] [Allow Session] [Allow Always] [Deny]
 
 **File:** `src/mcp_claude_code/executor/interaction_handler.py`
 
-Detects JSON markers in Claude output and calls `ctx.elicit()` to show UI in IDE.
+Detects JSON markers in Claude output using balanced brace parsing (not regex) and calls `ctx.elicit()` to show UI in IDE.
+
+```python
+def _extract_json_marker(self, text: str, marker: str) -> dict[str, Any] | None:
+    """Extract JSON marker data using proper JSON parsing with balanced braces.
+    Properly handles nested objects unlike regex-based approaches."""
+
+def _extract_balanced_json(self, text: str, start_idx: int) -> str | None:
+    """Extract complete JSON object using balanced brace counting."""
+```
+
+---
+
+## Graceful Shutdown
+
+The server supports graceful shutdown on SIGTERM/SIGINT:
+
+```python
+async def _graceful_shutdown(sig: signal.Signals) -> None:
+    """Handle graceful shutdown on signal."""
+    # Terminates all active executors
+    # Cleans up permission servers
+    # Removes temporary files
+```
 
 ---
 
@@ -154,3 +243,5 @@ Detects JSON markers in Claude output and calls `ctx.elicit()` to show UI in IDE
 | `src/mcp_claude_code/permission_server/approver.py` | MCP permission tool |
 | `src/mcp_claude_code/permission_server/callback_server.py` | Unix socket elicitation bridge |
 | `src/mcp_claude_code/storage/permission_manager.py` | Permission caching and persistence |
+| `src/mcp_claude_code/models/interactions.py` | `PermissionResponse`, `PermissionDecision` enums |
+| `src/mcp_claude_code/config.py` | `Settings` with configurable timeouts |

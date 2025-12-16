@@ -6,12 +6,13 @@ import logging
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..config import Settings
-from ..models.events import ClaudeEventType
-from ..models.interactions import PermissionDecision
+from ..models.events import ClaudeEvent, ClaudeEventType
+from ..models.interactions import PermissionDecision, PermissionResponse
 from ..permission_server.callback_server import ElicitationCallbackServer
 from ..prompts import get_system_prompt
 from ..storage.permission_manager import PermissionManager
@@ -24,6 +25,23 @@ from .stream_parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EventLoopResult:
+    """Result from event loop processing."""
+
+    is_complete: bool
+    """True if execution completed (RESULT event received)."""
+
+    result: dict[str, Any] | None = None
+    """Final result dictionary if complete."""
+
+    pending_resume_response: str | None = None
+    """User response pending for session resumption."""
+
+    output_buffer: list[str] = field(default_factory=list)
+    """Accumulated output from Claude."""
 
 
 class InteractiveExecutor:
@@ -157,29 +175,22 @@ class InteractiveExecutor:
             # 6. Main event loop
             try:
                 result = await asyncio.wait_for(
-                    self._event_loop(inactivity_timeout_seconds),
+                    self._run_event_loop(inactivity_timeout_seconds),
                     timeout=max_execution_seconds,
                 )
                 return result
             except asyncio.TimeoutError:
                 await self._terminate_process()
-                return {
-                    "success": False,
-                    "error": f"Execution exceeded {max_execution_seconds}s timeout",
-                    "returncode": -1,
-                    "permissions_requested": self.permissions_requested,
-                    "permissions_granted": self.permissions_granted,
-                    "choices_asked": self.choices_asked,
-                    "questions_asked": self.questions_asked,
-                    "confirmations_asked": self.confirmations_asked,
-                }
+                return self._build_error_result(
+                    f"Execution exceeded {max_execution_seconds}s timeout"
+                )
 
         finally:
             # Cleanup native permission server resources
             await self._cleanup_permission_server()
 
-    async def _event_loop(self, inactivity_timeout: int) -> dict[str, Any]:
-        """Main event processing loop.
+    async def _run_event_loop(self, inactivity_timeout: int) -> dict[str, Any]:
+        """Main event processing loop with resumption support.
 
         Args:
             inactivity_timeout: Seconds of inactivity before timeout
@@ -187,191 +198,207 @@ class InteractiveExecutor:
         Returns:
             Execution result dictionary
         """
-        output_buffer = []
-        last_activity = time.time()
-        pending_resume_response = None  # Track if we need to resume
-        start_time = time.time()
+        loop_result = await self._process_events(inactivity_timeout)
 
-        # Heartbeat mechanism - sends progress every 5 seconds
-        heartbeat_interval = 5
-        heartbeat_count = 0
-        heartbeat_running = True
-
-        async def heartbeat_task():
-            nonlocal heartbeat_count
-            while heartbeat_running:
-                await asyncio.sleep(heartbeat_interval)
-                if not heartbeat_running:
-                    break
-                heartbeat_count += 1
-                elapsed = int(time.time() - start_time)
-                if self.ctx:
-                    try:
-                        await self.ctx.report_progress(
-                            progress=heartbeat_count,
-                            total=None,
-                            message=f"⏳ Still working... ({elapsed}s elapsed)",
-                        )
-                    except Exception as e:
-                        logger.debug(f"Heartbeat progress report failed: {e}")
-
-        # Start heartbeat in background
-        heartbeat = asyncio.create_task(heartbeat_task())
-        logger.debug("[InteractiveExecutor] Starting event loop with heartbeat")
-
-        try:
-            async for event in self.parser.parse_events():
-                last_activity = time.time()
-
-                logger.info(f"[InteractiveExecutor] ⚡ EVENT RECEIVED: {event.type}")
-                logger.debug(f"[InteractiveExecutor] Event data keys: {list(event.data.keys()) if hasattr(event, 'data') else 'NO DATA'}")
-
-                # Log full message content for ASSISTANT events to see tool uses
-                if event.type == ClaudeEventType.ASSISTANT and "message" in event.data:
-                    message = event.data.get("message", {})
-                    if isinstance(message, dict):
-                        content = message.get("content", [])
-                        logger.info(f"[InteractiveExecutor] 📦 Message content blocks: {len(content) if isinstance(content, list) else 0}")
-                        if isinstance(content, list):
-                            for i, block in enumerate(content):
-                                if isinstance(block, dict):
-                                    block_type = block.get("type", "unknown")
-                                    logger.info(f"[InteractiveExecutor]   Block {i}: type={block_type}")
-                                    if block_type == "tool_use":
-                                        logger.info(f"[InteractiveExecutor]     Tool: {block.get('name', 'unknown')}")
-                                        logger.info(f"[InteractiveExecutor]     Input: {block.get('input', {})}")
-                                    elif block_type == "text":
-                                        text = block.get("text", "")
-                                        logger.info(f"[InteractiveExecutor]     Text: {text[:200]}")
-
-                # Extract session_id if present
-                if "session_id" in event.data:
-                    self.session_id = event.data["session_id"]
-                    logger.info(f"[InteractiveExecutor] 📋 SESSION_ID captured: {self.session_id}")
-
-                # Update progress
-                await self._report_progress(event)
-
-                # Handle interactions
-                logger.debug(f"[InteractiveExecutor] Calling interaction_handler.handle_event for {event.type}")
-                interaction_response = await self.interaction_handler.handle_event(event)
-                if interaction_response:
-                    logger.info(f"[InteractiveExecutor] 💬 INTERACTION HANDLED: type={interaction_response['type']}, text={interaction_response['text'][:100]}")
-
-                    # Update metrics
-                    self._update_metrics(interaction_response["type"])
-                    logger.info(f"[InteractiveExecutor] 📊 Metrics: permissions={self.permissions_requested}, "
-                              f"choices={self.choices_asked}, questions={self.questions_asked}, "
-                              f"confirmations={self.confirmations_asked}")
-
-                    # For multi-turn: wait for process to exit, then restart with --resume
-                    if self.session_id:
-                        logger.info(f"[InteractiveExecutor] 🔄 Preparing to resume session {self.session_id}")
-
-                        # Format response with context for better Claude understanding
-                        pending_resume_response = self._format_response_with_context(interaction_response)
-                        logger.info(f"[InteractiveExecutor] 💾 Saved response for resume: {pending_resume_response[:100]}")
-
-                        # Continue processing events until process naturally exits
-                        logger.info(f"[InteractiveExecutor] ⏳ Continuing to process events until process exits...")
-                    else:
-                        logger.warning("[InteractiveExecutor] ⚠️ No session_id available for multi-turn - falling back to stdin")
-                        await self._send_stdin_message(interaction_response["text"])
-                else:
-                    logger.debug(f"[InteractiveExecutor] No interaction detected in {event.type} event")
-
-                # Accumulate output
-                text_content = extract_text_content(event)
-                if text_content:
-                    output_buffer.append(text_content)
-                    logger.info(f"[InteractiveExecutor] 📝 Claude output: {text_content[:500]}")
-
-                # Check for completion
-                if event.type == ClaudeEventType.RESULT:
-                    logger.info("[InteractiveExecutor] ✅ RESULT event received - execution complete")
-
-                    # Check if we need to resume before returning
-                    if pending_resume_response and self.session_id:
-                        logger.info(f"[InteractiveExecutor] 🔄 RESULT received but need to resume - breaking to resume session")
-                        break  # Exit loop to trigger resumption
-
-                    # No resumption needed - return final result
-                    result = parse_result_event(event)
-
-                    # Use output_buffer if result output is empty
-                    if not result.get("output") and output_buffer:
-                        result["output"] = "\n".join(output_buffer)
-                        logger.info(f"[InteractiveExecutor] Using accumulated output_buffer ({len(output_buffer)} parts)")
-
-                    result.update(
-                        {
-                            "permissions_requested": self.permissions_requested,
-                            "permissions_granted": self.permissions_granted,
-                            "choices_asked": self.choices_asked,
-                            "questions_asked": self.questions_asked,
-                            "confirmations_asked": self.confirmations_asked,
-                        }
-                    )
-                    logger.info(f"[InteractiveExecutor] Final metrics: {result}")
-                    logger.info(f"[InteractiveExecutor] Final output length: {len(result.get('output', ''))}")
-                    return result
-
-                # Check inactivity timeout
-                if time.time() - last_activity > inactivity_timeout:
-                    logger.warning(f"[InteractiveExecutor] ⏰ Inactivity timeout after {inactivity_timeout}s")
-                    await self._terminate_process()
-                    return {
-                        "success": False,
-                        "error": f"Inactivity timeout after {inactivity_timeout}s",
-                        "output": "\n".join(output_buffer),
-                        "returncode": -1,
-                        "permissions_requested": self.permissions_requested,
-                        "permissions_granted": self.permissions_granted,
-                    }
-
-        finally:
-            # Stop heartbeat when done
-            heartbeat_running = False
-            heartbeat.cancel()
-            try:
-                await heartbeat
-            except asyncio.CancelledError:
-                pass
-
-        # Process ended - check if we need to resume
-        if pending_resume_response and self.session_id:
-            logger.info(f"[InteractiveExecutor] 🔄 Event loop ended, now resuming with session {self.session_id}")
+        # Handle resumption if needed
+        if loop_result.pending_resume_response and self.session_id:
+            logger.info(f"[InteractiveExecutor] 🔄 Event loop ended, resuming with session {self.session_id}")
 
             # Terminate current process before resuming
             if self.process and self.process.returncode is None:
-                logger.info(f"[InteractiveExecutor] 🛑 Terminating current process...")
+                logger.info("[InteractiveExecutor] 🛑 Terminating current process...")
                 await self._terminate_process()
-                logger.info(f"[InteractiveExecutor] ✅ Process terminated")
             else:
                 logger.info(f"[InteractiveExecutor] Process already exited (returncode={self.process.returncode if self.process else 'None'})")
 
             # Resume with the user's response
-            logger.info(f"[InteractiveExecutor] 📞 Calling _resume_session with response: {pending_resume_response[:100]}")
-            result = await self._resume_session(pending_resume_response)
-            logger.info(f"[InteractiveExecutor] ✅ _resume_session completed, result keys: {list(result.keys()) if result else 'None'}")
-            if result:
-                return result
+            return await self._resume_session(loop_result.pending_resume_response)
 
-        # Process ended without resumption needed
+        # Return result or build from process exit
+        if loop_result.result:
+            return loop_result.result
+
+        # Process ended without RESULT event
         returncode = await self.process.wait()
         stderr = await self.process.stderr.read()
 
         return {
             "success": returncode == 0,
-            "output": "\n".join(output_buffer),
+            "output": "\n".join(loop_result.output_buffer),
             "error": stderr.decode() if stderr else None,
             "returncode": returncode,
-            "permissions_requested": self.permissions_requested,
-            "permissions_granted": self.permissions_granted,
-            "choices_asked": self.choices_asked,
-            "questions_asked": self.questions_asked,
-            "confirmations_asked": self.confirmations_asked,
+            **self._get_metrics(),
         }
+
+    async def _process_events(
+        self,
+        inactivity_timeout: int,
+        is_resumed: bool = False,
+    ) -> EventLoopResult:
+        """Process events from Claude Code CLI stream.
+
+        This is the unified event processing logic used by both initial
+        execution and session resumption.
+
+        Args:
+            inactivity_timeout: Seconds of inactivity before timeout
+            is_resumed: True if this is a resumed session
+
+        Returns:
+            EventLoopResult with processing outcome
+        """
+        output_buffer: list[str] = []
+        last_activity = time.time()
+        pending_resume_response: str | None = None
+        start_time = time.time()
+        log_prefix = "[InteractiveExecutor] RESUMED" if is_resumed else "[InteractiveExecutor]"
+
+        # Heartbeat mechanism - sends progress every 5 seconds
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(start_time)
+        )
+
+        try:
+            async for event in self.parser.parse_events():
+                last_activity = time.time()
+
+                logger.info(f"{log_prefix} ⚡ EVENT RECEIVED: {event.type}")
+                self._log_event_details(event, log_prefix)
+
+                # Extract session_id if present
+                if "session_id" in event.data:
+                    self.session_id = event.data["session_id"]
+                    logger.info(f"{log_prefix} 📋 SESSION_ID captured: {self.session_id}")
+
+                # Update progress
+                await self._report_progress(event)
+
+                # Handle interactions
+                interaction_response = await self.interaction_handler.handle_event(event)
+                if interaction_response:
+                    logger.info(
+                        f"{log_prefix} 💬 INTERACTION HANDLED: "
+                        f"type={interaction_response['type']}, text={interaction_response['text'][:100]}"
+                    )
+
+                    # Update metrics
+                    self._update_metrics(interaction_response["type"])
+
+                    # For multi-turn: prepare to resume
+                    if self.session_id:
+                        pending_resume_response = self._format_response_with_context(interaction_response)
+                        logger.info(f"{log_prefix} 💾 Saved response for resume: {pending_resume_response[:100]}")
+                    else:
+                        logger.warning(f"{log_prefix} ⚠️ No session_id - falling back to stdin")
+                        await self._send_stdin_message(interaction_response["text"])
+
+                # Accumulate output
+                text_content = extract_text_content(event)
+                if text_content:
+                    output_buffer.append(text_content)
+                    logger.info(f"{log_prefix} 📝 Claude output: {text_content[:500]}")
+
+                # Check for completion
+                if event.type == ClaudeEventType.RESULT:
+                    logger.info(f"{log_prefix} ✅ RESULT event received")
+
+                    # Need to resume?
+                    if pending_resume_response and self.session_id:
+                        logger.info(f"{log_prefix} 🔄 RESULT received but need to resume")
+                        return EventLoopResult(
+                            is_complete=False,
+                            pending_resume_response=pending_resume_response,
+                            output_buffer=output_buffer,
+                        )
+
+                    # Complete - return result
+                    result = parse_result_event(event)
+                    if not result.get("output") and output_buffer:
+                        result["output"] = "\n".join(output_buffer)
+
+                    result.update(self._get_metrics())
+                    return EventLoopResult(
+                        is_complete=True,
+                        result=result,
+                        output_buffer=output_buffer,
+                    )
+
+                # Check inactivity timeout
+                if time.time() - last_activity > inactivity_timeout:
+                    logger.warning(f"{log_prefix} ⏰ Inactivity timeout after {inactivity_timeout}s")
+                    await self._terminate_process()
+                    return EventLoopResult(
+                        is_complete=True,
+                        result=self._build_error_result(
+                            f"Inactivity timeout after {inactivity_timeout}s",
+                            output="\n".join(output_buffer),
+                        ),
+                        output_buffer=output_buffer,
+                    )
+
+        finally:
+            # Stop heartbeat
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stream ended - check if resumption needed
+        return EventLoopResult(
+            is_complete=False,
+            pending_resume_response=pending_resume_response,
+            output_buffer=output_buffer,
+        )
+
+    async def _heartbeat_loop(self, start_time: float) -> None:
+        """Send periodic heartbeat progress messages.
+
+        Args:
+            start_time: When execution started
+        """
+        heartbeat_interval = 5
+        heartbeat_count = 0
+
+        while True:
+            await asyncio.sleep(heartbeat_interval)
+            heartbeat_count += 1
+            elapsed = int(time.time() - start_time)
+            if self.ctx:
+                try:
+                    await self.ctx.report_progress(
+                        progress=heartbeat_count,
+                        total=None,
+                        message=f"⏳ Still working... ({elapsed}s elapsed)",
+                    )
+                except Exception as e:
+                    logger.debug(f"Heartbeat progress report failed: {e}")
+
+    def _log_event_details(self, event: ClaudeEvent, log_prefix: str) -> None:
+        """Log detailed event information for debugging.
+
+        Args:
+            event: Claude event to log
+            log_prefix: Prefix for log messages
+        """
+        logger.debug(f"{log_prefix} Event data keys: {list(event.data.keys()) if hasattr(event, 'data') else 'NO DATA'}")
+
+        if event.type == ClaudeEventType.ASSISTANT and "message" in event.data:
+            message = event.data.get("message", {})
+            if isinstance(message, dict):
+                content = message.get("content", [])
+                logger.info(f"{log_prefix} 📦 Message content blocks: {len(content) if isinstance(content, list) else 0}")
+                if isinstance(content, list):
+                    for i, block in enumerate(content):
+                        if isinstance(block, dict):
+                            block_type = block.get("type", "unknown")
+                            logger.info(f"{log_prefix}   Block {i}: type={block_type}")
+                            if block_type == "tool_use":
+                                logger.info(f"{log_prefix}     Tool: {block.get('name', 'unknown')}")
+                                logger.info(f"{log_prefix}     Input: {block.get('input', {})}")
+                            elif block_type == "text":
+                                text = block.get("text", "")
+                                logger.info(f"{log_prefix}     Text: {text[:200]}")
 
     def _build_command(
         self,
@@ -486,6 +513,44 @@ class InteractiveExecutor:
         elif interaction_type == "confirmation":
             self.confirmations_asked += 1
 
+    def _get_metrics(self) -> dict[str, int]:
+        """Get current execution metrics.
+
+        Returns:
+            Dictionary with all metric counts
+        """
+        return {
+            "permissions_requested": self.permissions_requested,
+            "permissions_granted": self.permissions_granted,
+            "choices_asked": self.choices_asked,
+            "questions_asked": self.questions_asked,
+            "confirmations_asked": self.confirmations_asked,
+        }
+
+    def _build_error_result(
+        self,
+        error: str,
+        output: str = "",
+        returncode: int = -1,
+    ) -> dict[str, Any]:
+        """Build error result dictionary.
+
+        Args:
+            error: Error message
+            output: Any output collected
+            returncode: Process return code
+
+        Returns:
+            Error result dictionary with metrics
+        """
+        return {
+            "success": False,
+            "error": error,
+            "output": output,
+            "returncode": returncode,
+            **self._get_metrics(),
+        }
+
     def _is_permission_event(self, event: Any) -> bool:
         """Check if event is a permission tool call that should not be reported.
 
@@ -514,14 +579,14 @@ class InteractiveExecutor:
 
         return False
 
-    async def _resume_session(self, user_response: str) -> dict[str, Any] | None:
+    async def _resume_session(self, user_response: str) -> dict[str, Any]:
         """Resume session with user's response.
 
         Args:
             user_response: User's answer to send to Claude
 
         Returns:
-            Execution result dictionary, or None if continuation needed
+            Execution result dictionary
         """
         # Build resume command
         cmd = self._build_command(self.model, self.workspace_root, resume_session_id=self.session_id)
@@ -542,135 +607,32 @@ class InteractiveExecutor:
         logger.info(f"[InteractiveExecutor] 📤 Sending user response to resumed session: {user_response[:200]}")
         await self._send_stdin_message(user_response)
 
-        # Continue processing events from resumed session
-        output_buffer = []
-        last_activity = time.time()
-        start_time = time.time()
+        # Process events from resumed session
+        loop_result = await self._process_events(
+            inactivity_timeout=self.settings.inactivity_timeout_seconds,
+            is_resumed=True,
+        )
 
-        # Heartbeat mechanism - sends progress every 5 seconds
-        heartbeat_interval = 5
-        heartbeat_count = 0
-        heartbeat_running = True
+        # Handle recursive resumption
+        if loop_result.pending_resume_response and self.session_id:
+            logger.info(f"[InteractiveExecutor] 🔄 RESUMING AGAIN with session {self.session_id}")
+            await self._terminate_process()
+            return await self._resume_session(loop_result.pending_resume_response)
 
-        async def heartbeat_task():
-            nonlocal heartbeat_count
-            while heartbeat_running:
-                await asyncio.sleep(heartbeat_interval)
-                if not heartbeat_running:
-                    break
-                heartbeat_count += 1
-                elapsed = int(time.time() - start_time)
-                if self.ctx:
-                    try:
-                        await self.ctx.report_progress(
-                            progress=heartbeat_count,
-                            total=None,
-                            message=f"⏳ Still working... ({elapsed}s elapsed)",
-                        )
-                    except Exception as e:
-                        logger.debug(f"Heartbeat progress report failed: {e}")
+        # Return result
+        if loop_result.result:
+            return loop_result.result
 
-        # Start heartbeat in background
-        heartbeat = asyncio.create_task(heartbeat_task())
-
-        try:
-            async for event in self.parser.parse_events():
-                last_activity = time.time()
-
-                logger.info(f"[InteractiveExecutor] ⚡ RESUMED EVENT: {event.type}")
-
-                # Log full message content for ASSISTANT events to see tool uses
-                if event.type == ClaudeEventType.ASSISTANT and "message" in event.data:
-                    message = event.data.get("message", {})
-                    if isinstance(message, dict):
-                        content = message.get("content", [])
-                        logger.info(f"[InteractiveExecutor] 📦 RESUMED Message content blocks: {len(content) if isinstance(content, list) else 0}")
-                        if isinstance(content, list):
-                            for i, block in enumerate(content):
-                                if isinstance(block, dict):
-                                    block_type = block.get("type", "unknown")
-                                    logger.info(f"[InteractiveExecutor]   RESUMED Block {i}: type={block_type}")
-                                    if block_type == "tool_use":
-                                        logger.info(f"[InteractiveExecutor]     TOOL USE: {block.get('name', 'unknown')}")
-                                        logger.info(f"[InteractiveExecutor]     Input: {block.get('input', {})}")
-                                    elif block_type == "text":
-                                        text = block.get("text", "")
-                                        logger.info(f"[InteractiveExecutor]     Text: {text[:200]}")
-
-                # Extract session_id if present
-                if "session_id" in event.data:
-                    self.session_id = event.data["session_id"]
-
-                # Update progress
-                await self._report_progress(event)
-
-                # Check for more interactions
-                interaction_response = await self.interaction_handler.handle_event(event)
-                if interaction_response:
-                    logger.info(f"[InteractiveExecutor] 💬 ANOTHER INTERACTION: type={interaction_response['type']}")
-
-                    # Update metrics
-                    self._update_metrics(interaction_response["type"])
-
-                    # Recursively resume again
-                    if self.session_id:
-                        logger.info(f"[InteractiveExecutor] 🔄 RESUMING AGAIN with session {self.session_id}")
-                        await self._terminate_process()
-                        # Format response with context for better Claude understanding
-                        formatted_response = self._format_response_with_context(interaction_response)
-                        result = await self._resume_session(formatted_response)
-                        if result:
-                            return result
-
-                # Accumulate output
-                text_content = extract_text_content(event)
-                if text_content:
-                    output_buffer.append(text_content)
-                    logger.info(f"[InteractiveExecutor] 📝 Resumed output: {text_content[:500]}")
-
-                # Check for completion
-                if event.type == ClaudeEventType.RESULT:
-                    logger.info("[InteractiveExecutor] ✅ RESUMED session completed")
-                    result = parse_result_event(event)
-
-                    # Use output_buffer if result output is empty
-                    if not result.get("output") and output_buffer:
-                        result["output"] = "\n".join(output_buffer)
-
-                    result.update(
-                        {
-                            "permissions_requested": self.permissions_requested,
-                            "permissions_granted": self.permissions_granted,
-                            "choices_asked": self.choices_asked,
-                            "questions_asked": self.questions_asked,
-                            "confirmations_asked": self.confirmations_asked,
-                        }
-                    )
-                    return result
-
-        finally:
-            # Stop heartbeat when done
-            heartbeat_running = False
-            heartbeat.cancel()
-            try:
-                await heartbeat
-            except asyncio.CancelledError:
-                pass
-
-        # Process ended without result
+        # Process ended without RESULT event
         returncode = await self.process.wait()
         stderr = await self.process.stderr.read()
 
         return {
             "success": returncode == 0,
-            "output": "\n".join(output_buffer),
+            "output": "\n".join(loop_result.output_buffer),
             "error": stderr.decode() if stderr else None,
             "returncode": returncode,
-            "permissions_requested": self.permissions_requested,
-            "permissions_granted": self.permissions_granted,
-            "choices_asked": self.choices_asked,
-            "questions_asked": self.questions_asked,
-            "confirmations_asked": self.confirmations_asked,
+            **self._get_metrics(),
         }
 
     async def _terminate_process(self) -> None:
@@ -716,7 +678,7 @@ class InteractiveExecutor:
             )
             if existing:
                 logger.info(f"[InteractiveExecutor] ✅ CACHED permission found: {existing.decision.value}")
-                logger.info(f"[InteractiveExecutor] ✅ Auto-granting (no dialog shown)")
+                logger.info("[InteractiveExecutor] ✅ Auto-granting (no dialog shown)")
                 self.permissions_requested += 1
                 self.permissions_granted += 1
                 return {"granted": True, "decision": existing.decision.value}
@@ -726,37 +688,38 @@ class InteractiveExecutor:
             logger.info(f"[InteractiveExecutor] 🔔 SHOWING PERMISSION DIALOG: {message}")
             logger.info(f"[InteractiveExecutor] 🔔 This is permission request #{self.permissions_requested + 1}")
 
+            # Use centralized permission options from enum
             result = await self.ctx.elicit(
                 message,
-                response_type=["Allow Once", "Allow Session", "Allow Always", "Deny"],
+                response_type=PermissionResponse.all_options(),
             )
 
             self.permissions_requested += 1
             logger.info(f"[InteractiveExecutor] 🔔 User responded: action={result.action}, data={result.data}")
 
-            if result.action != "accept" or result.data == "Deny":
-                logger.info(f"[InteractiveExecutor] ❌ Permission DENIED by user")
+            if result.action != "accept" or result.data == PermissionResponse.DENY.value:
+                logger.info("[InteractiveExecutor] ❌ Permission DENIED by user")
                 return {"granted": False, "message": "Permission denied by user"}
 
             self.permissions_granted += 1
-            decision = result.data
-            logger.info(f"[InteractiveExecutor] ✅ Permission GRANTED: {decision}")
+            decision_str = result.data
+            logger.info(f"[InteractiveExecutor] ✅ Permission GRANTED: {decision_str}")
 
-            # Store permission if needed
-            if decision == "Allow Session":
-                self.permission_manager.store_permission(
-                    action=tool_name,
-                    target=target,
-                    decision=PermissionDecision.ALLOW_SESSION,
-                )
-            elif decision == "Allow Always":
-                self.permission_manager.store_permission(
-                    action=tool_name,
-                    target=target,
-                    decision=PermissionDecision.ALLOW_ALWAYS,
-                )
+            # Convert string response to enum and store if needed
+            try:
+                response = PermissionResponse.from_string(decision_str)
+                decision = response.to_decision()
 
-            return {"granted": True, "decision": decision}
+                if decision in (PermissionDecision.ALLOW_SESSION, PermissionDecision.ALLOW_ALWAYS):
+                    self.permission_manager.store_permission(
+                        action=tool_name,
+                        target=target,
+                        decision=decision,
+                    )
+            except ValueError as e:
+                logger.warning(f"[InteractiveExecutor] Unknown permission response: {e}")
+
+            return {"granted": True, "decision": decision_str}
 
         # Start callback server (Unix socket)
         self.callback_server = ElicitationCallbackServer(
@@ -766,16 +729,23 @@ class InteractiveExecutor:
         socket_path = await self.callback_server.start()
         logger.info(f"[InteractiveExecutor] Callback server started at {socket_path}")
 
-        # Generate MCP config for Claude Code
+        # Generate MCP config for Claude Code with settings
         approver_script = str(
             Path(__file__).parent.parent / "permission_server" / "approver.py"
         )
 
+        # Pass timeout and retry settings to approver subprocess
         mcp_config = {
             "mcpServers": {
                 "perm": {
                     "command": sys.executable,
-                    "args": [approver_script, socket_path],
+                    "args": [
+                        approver_script,
+                        socket_path,
+                        "--timeout", str(self.settings.permission_timeout_seconds),
+                        "--retries", str(self.settings.socket_retry_attempts),
+                        "--retry-delay", str(self.settings.socket_retry_delay_seconds),
+                    ],
                 }
             }
         }
@@ -847,47 +817,74 @@ class InteractiveExecutor:
         Returns:
             Human-readable target string (normalized for paths)
         """
-        if tool_name in ("Read", "Write", "Edit"):
-            path = tool_input.get("file_path", "")
-            if path:
-                # Normalize path for consistent caching
-                try:
-                    normalized = str(Path(path).resolve())
-                    logger.debug(f"[InteractiveExecutor] Normalized path: {path} -> {normalized}")
-                    return normalized
-                except Exception:
-                    return path
-            return str(tool_input)
-        elif tool_name == "Bash":
-            cmd = tool_input.get("command", str(tool_input))
-            # Normalize command by stripping whitespace
-            cmd = cmd.strip()
-            return cmd[:100] if len(cmd) > 100 else cmd
-        elif tool_name == "Glob":
-            pattern = tool_input.get("pattern", str(tool_input))
-            path = tool_input.get("path", "")
-            if path:
-                try:
-                    normalized_path = str(Path(path).resolve())
-                    return f"{pattern} in {normalized_path}"
-                except Exception:
-                    return f"{pattern} in {path}"
-            return pattern
-        elif tool_name == "Grep":
-            pattern = tool_input.get("pattern", "")
-            path = tool_input.get("path", ".")
-            if path:
-                try:
-                    normalized_path = str(Path(path).resolve())
-                    return f"{pattern} in {normalized_path}"
-                except Exception:
-                    return f"{pattern} in {path}"
-            return f"{pattern} in ."
-        elif tool_name == "WebFetch":
-            return tool_input.get("url", str(tool_input))
-        elif tool_name == "WebSearch":
-            return tool_input.get("query", str(tool_input))
+        # Strategy pattern for target formatting
+        formatters = {
+            "Read": lambda i: self._normalize_path(i.get("file_path", "")),
+            "Write": lambda i: self._normalize_path(i.get("file_path", "")),
+            "Edit": lambda i: self._normalize_path(i.get("file_path", "")),
+            "Bash": lambda i: i.get("command", str(i)).strip()[:100],
+            "Glob": lambda i: self._format_glob_target(i),
+            "Grep": lambda i: self._format_grep_target(i),
+            "WebFetch": lambda i: i.get("url", str(i)),
+            "WebSearch": lambda i: i.get("query", str(i)),
+        }
+
+        formatter = formatters.get(tool_name)
+        if formatter:
+            result = formatter(tool_input)
+            if result:
+                return result
 
         # Default: truncated string representation
         target = str(tool_input)
         return target[:100] if len(target) > 100 else target
+
+    def _normalize_path(self, path: str) -> str:
+        """Normalize file path for consistent caching.
+
+        Args:
+            path: File path to normalize
+
+        Returns:
+            Normalized absolute path, or original if normalization fails
+        """
+        if not path:
+            return ""
+        try:
+            normalized = str(Path(path).resolve())
+            logger.debug(f"[InteractiveExecutor] Normalized path: {path} -> {normalized}")
+            return normalized
+        except Exception:
+            return path
+
+    def _format_glob_target(self, tool_input: dict) -> str:
+        """Format Glob tool target.
+
+        Args:
+            tool_input: Glob tool input
+
+        Returns:
+            Formatted target string
+        """
+        pattern = tool_input.get("pattern", str(tool_input))
+        path = tool_input.get("path", "")
+        if path:
+            normalized_path = self._normalize_path(path)
+            return f"{pattern} in {normalized_path}"
+        return pattern
+
+    def _format_grep_target(self, tool_input: dict) -> str:
+        """Format Grep tool target.
+
+        Args:
+            tool_input: Grep tool input
+
+        Returns:
+            Formatted target string
+        """
+        pattern = tool_input.get("pattern", "")
+        path = tool_input.get("path", ".")
+        if path:
+            normalized_path = self._normalize_path(path)
+            return f"{pattern} in {normalized_path}"
+        return f"{pattern} in ."

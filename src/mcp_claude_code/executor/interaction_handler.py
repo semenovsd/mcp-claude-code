@@ -6,7 +6,6 @@ and do NOT go through this handler.
 
 import json
 import logging
-import re
 from typing import Any
 
 from ..models.events import ClaudeEvent, ClaudeEventType
@@ -19,10 +18,10 @@ from .stream_parser import extract_text_content
 
 logger = logging.getLogger(__name__)
 
-# Regex patterns for detecting JSON markers in Claude's output
-CHOICE_PATTERN = r'\{"\s*__user_choice__"\s*:\s*(\{[^}]+\})\s*\}'
-QUESTION_PATTERN = r'\{"\s*__user_question__"\s*:\s*(\{[^}]+\})\s*\}'
-CONFIRMATION_PATTERN = r'\{"\s*__confirmation__"\s*:\s*(\{[^}]+\})\s*\}'
+# JSON marker keys
+MARKER_CHOICE = "__user_choice__"
+MARKER_QUESTION = "__user_question__"
+MARKER_CONFIRMATION = "__confirmation__"
 
 
 class InteractionHandler:
@@ -109,19 +108,18 @@ class InteractionHandler:
         Returns:
             ChoiceQuestion if found, None otherwise
         """
-        match = re.search(CHOICE_PATTERN, text)
-        if not match:
+        data = self._extract_json_marker(text, MARKER_CHOICE)
+        if not data:
             return None
 
         try:
-            data = json.loads(match.group(1))
             return ChoiceQuestion(
                 question=data["question"],
                 options=data["options"],
                 multiSelect=data.get("multiSelect", False),
             )
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            print(f"Warning: Malformed choice JSON: {e}")
+        except (KeyError, ValueError) as e:
+            logger.warning(f"Malformed choice JSON data: {e}")
             return None
 
     def _detect_question(self, text: str) -> TextQuestion | None:
@@ -133,18 +131,17 @@ class InteractionHandler:
         Returns:
             TextQuestion if found, None otherwise
         """
-        match = re.search(QUESTION_PATTERN, text)
-        if not match:
+        data = self._extract_json_marker(text, MARKER_QUESTION)
+        if not data:
             return None
 
         try:
-            data = json.loads(match.group(1))
             return TextQuestion(
                 question=data["question"],
                 default=data.get("default", ""),
             )
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            print(f"Warning: Malformed question JSON: {e}")
+        except (KeyError, ValueError) as e:
+            logger.warning(f"Malformed question JSON data: {e}")
             return None
 
     def _detect_confirmation(self, text: str) -> Confirmation | None:
@@ -156,19 +153,102 @@ class InteractionHandler:
         Returns:
             Confirmation if found, None otherwise
         """
-        match = re.search(CONFIRMATION_PATTERN, text)
-        if not match:
+        data = self._extract_json_marker(text, MARKER_CONFIRMATION)
+        if not data:
             return None
 
         try:
-            data = json.loads(match.group(1))
             return Confirmation(
                 question=data["question"],
                 warning=data.get("warning"),
             )
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            print(f"Warning: Malformed confirmation JSON: {e}")
+        except (KeyError, ValueError) as e:
+            logger.warning(f"Malformed confirmation JSON data: {e}")
             return None
+
+    def _extract_json_marker(self, text: str, marker: str) -> dict[str, Any] | None:
+        """Extract JSON marker data using proper JSON parsing with balanced braces.
+
+        This method properly handles nested objects unlike regex-based approaches.
+
+        Args:
+            text: Text to search in
+            marker: Marker key to look for (e.g., "__user_choice__")
+
+        Returns:
+            Extracted data dict or None if not found
+        """
+        # Find the marker in text
+        marker_str = f'"{marker}"'
+        idx = text.find(marker_str)
+        if idx == -1:
+            return None
+
+        # Find the opening brace before the marker
+        # Go backwards to find the start of the JSON object
+        start_idx = text.rfind("{", 0, idx)
+        if start_idx == -1:
+            return None
+
+        # Parse JSON starting from the opening brace using balanced braces
+        try:
+            # Try to find the complete JSON object using balanced braces
+            json_str = self._extract_balanced_json(text, start_idx)
+            if not json_str:
+                return None
+
+            full_obj = json.loads(json_str)
+            if marker in full_obj and isinstance(full_obj[marker], dict):
+                return dict(full_obj[marker])
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON marker {marker}: {e}")
+            logger.debug(f"Text around marker: {text[max(0, idx-50):idx+100]}")
+
+        return None
+
+    def _extract_balanced_json(self, text: str, start_idx: int) -> str | None:
+        """Extract a complete JSON object using balanced brace counting.
+
+        Args:
+            text: Text to extract from
+            start_idx: Index of opening brace
+
+        Returns:
+            Complete JSON string or None if not balanced
+        """
+        if start_idx >= len(text) or text[start_idx] != "{":
+            return None
+
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i in range(start_idx, len(text)):
+            char = text[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == "\\":
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx:i + 1]
+
+        return None
 
     async def _handle_choice(self, choice: ChoiceQuestion) -> dict[str, Any]:
         """Handle choice question.

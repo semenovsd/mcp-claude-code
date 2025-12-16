@@ -2,9 +2,12 @@
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from ..models.interactions import PermissionDecision, StoredPermission
+
+logger = logging.getLogger(__name__)
 
 
 class PermissionManager:
@@ -142,7 +145,7 @@ class PermissionManager:
                 self.persistent_permissions[perm.hash] = perm
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            print(f"Error loading permissions: {e}")
+            logger.error(f"Error loading permissions from {self.storage_path}: {e}")
 
     def _save_persistent(self) -> None:
         """Save permissions to JSON file."""

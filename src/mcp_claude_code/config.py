@@ -14,6 +14,9 @@ class Settings(BaseSettings):
         >>> settings = Settings()
         >>> settings.claude_code_path
         'claude'
+
+        # Override via environment:
+        # MCP_CLAUDE_PERMISSION_TIMEOUT_SECONDS=1800 python -m mcp_claude_code
     """
 
     model_config = SettingsConfigDict(env_prefix="MCP_CLAUDE_")
@@ -25,6 +28,14 @@ class Settings(BaseSettings):
     # Timeouts
     max_execution_seconds: int = 600
     inactivity_timeout_seconds: int = 120
+
+    # Permission-specific timeouts (user may be away)
+    permission_timeout_seconds: int = 3600  # 60 minutes - user may be away
+    socket_read_timeout_seconds: int = 120  # Internal socket communication
+
+    # Retry settings
+    socket_retry_attempts: int = 3
+    socket_retry_delay_seconds: float = 0.1
 
     # Workspace
     workspace_root: str = ""  # Defaults to $WORKSPACE_ROOT

@@ -3,6 +3,7 @@
 Permissions are handled natively via --permission-prompt-tool.
 This module provides models for:
 - Permission decisions and storage
+- Permission responses (UI labels)
 - Choice questions
 - Text questions
 - Confirmations
@@ -13,12 +14,57 @@ from enum import Enum
 
 
 class PermissionDecision(Enum):
-    """Permission decision types for native permission handling."""
+    """Permission decision types for native permission handling (internal storage)."""
 
     ALLOW_ONCE = "allow_once"
     ALLOW_SESSION = "allow_session"
     ALLOW_ALWAYS = "allow_always"
     DENY = "deny"
+
+
+class PermissionResponse(Enum):
+    """User-facing permission response labels for MCP Elicitation UI.
+
+    These are the exact strings shown to users in permission dialogs.
+    """
+
+    ALLOW_ONCE = "Allow Once"
+    ALLOW_SESSION = "Allow Session"
+    ALLOW_ALWAYS = "Allow Always"
+    DENY = "Deny"
+
+    @classmethod
+    def all_options(cls) -> list[str]:
+        """Get all permission options as a list of strings for elicitation."""
+        return [opt.value for opt in cls]
+
+    @classmethod
+    def from_string(cls, value: str) -> "PermissionResponse":
+        """Convert string to PermissionResponse enum.
+
+        Args:
+            value: String value like "Allow Once"
+
+        Returns:
+            Corresponding PermissionResponse enum
+
+        Raises:
+            ValueError: If value doesn't match any option
+        """
+        for opt in cls:
+            if opt.value == value:
+                return opt
+        raise ValueError(f"Invalid permission response: {value}")
+
+    def to_decision(self) -> PermissionDecision:
+        """Convert UI response to internal decision type."""
+        mapping = {
+            PermissionResponse.ALLOW_ONCE: PermissionDecision.ALLOW_ONCE,
+            PermissionResponse.ALLOW_SESSION: PermissionDecision.ALLOW_SESSION,
+            PermissionResponse.ALLOW_ALWAYS: PermissionDecision.ALLOW_ALWAYS,
+            PermissionResponse.DENY: PermissionDecision.DENY,
+        }
+        return mapping[self]
 
 
 @dataclass

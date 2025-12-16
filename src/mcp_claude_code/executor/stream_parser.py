@@ -1,11 +1,13 @@
 """Stream parser for Claude Code CLI NDJSON output."""
 
-import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urlparse
 
 from ..models.events import ClaudeEvent, ClaudeEventType
+
+logger = logging.getLogger(__name__)
 
 
 # Tool emoji mapping for progress messages
@@ -82,7 +84,7 @@ class StreamParser:
                 yield line.decode("utf-8", errors="replace")
             except Exception as e:
                 # Log error but continue (graceful degradation)
-                print(f"StreamParser error: {e}")
+                logger.error(f"StreamParser error reading from stdout: {e}")
                 break
 
 

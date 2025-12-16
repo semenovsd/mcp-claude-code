@@ -319,10 +319,10 @@ class RealMCPClientSSE:
             model: Model to use (haiku, sonnet, opus)
             workspace_root: Working directory for file operations
             enable_permissions: Enable permission requests via native
-                --permission-prompt-tool mechanism
-            enable_choice_questions: Enable choice questions protocol
-            enable_text_questions: Enable text questions protocol
-            enable_confirmations: Enable confirmation dialogs protocol
+                --permission-prompt-tool mechanism (maps to skip_permissions=False)
+            enable_choice_questions: Enable choice questions protocol (not exposed in MCP API)
+            enable_text_questions: Enable text questions protocol (not exposed in MCP API)
+            enable_confirmations: Enable confirmation dialogs protocol (not exposed in MCP API)
 
         Returns:
             Result dictionary with:
@@ -342,17 +342,20 @@ class RealMCPClientSSE:
                 enable_permissions=False,
             )
             assert result["success"] == True
+
+        Note:
+            The MCP API only exposes skip_permissions parameter.
+            Choice/question/confirmation features are always enabled internally.
         """
         if not self.session:
             raise RuntimeError("Client not connected. Use 'async with client.connect(...)'")
 
+        # Map test client parameters to actual MCP API parameters
+        # The MCP API uses skip_permissions (inverse of enable_permissions)
         arguments = {
             "prompt": prompt,
             "model": model,
-            "enable_permissions": enable_permissions,
-            "enable_choice_questions": enable_choice_questions,
-            "enable_text_questions": enable_text_questions,
-            "enable_confirmations": enable_confirmations,
+            "skip_permissions": not enable_permissions,  # Inverted logic
         }
 
         if workspace_root:
@@ -362,9 +365,7 @@ class RealMCPClientSSE:
         logger.info(f"🚀 CALLING execute_claude")
         logger.info(f"   Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
         logger.info(f"   Workspace: {workspace_root}")
-        logger.info(f"   Permissions: {enable_permissions}")
-        logger.info(f"   Choices: {enable_choice_questions}")
-        logger.info(f"   Questions: {enable_text_questions}")
+        logger.info(f"   skip_permissions: {not enable_permissions}")
         logger.info("=" * 70)
 
         result = await self.session.call_tool("execute_claude", arguments=arguments)
